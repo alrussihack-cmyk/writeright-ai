@@ -1,0 +1,420 @@
+package com.writeright.ai.ui
+
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalLayoutDirection
+import com.writeright.ai.R
+import com.writeright.ai.board.BoardMetrics
+import com.writeright.ai.board.BoardViewModel
+import com.writeright.ai.board.buildInkPath
+
+private val InkStrokeWidth = 5.dp
+
+@Composable
+fun BoardScreen(vm: BoardViewModel) {
+    val density = LocalDensity.current
+    LaunchedEffect(density.density) { vm.density = density.density }
+
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+        Box(Modifier.fillMaxSize().background(Brand.Paper)) {
+            BoardCanvas(vm)
+            if (vm.strokes.isEmpty() && vm.activePoints.isEmpty()) {
+                EmptyHint(Modifier.align(Alignment.Center))
+            }
+            TopBar(vm, Modifier.align(Alignment.TopCenter))
+            BottomBar(vm, Modifier.align(Alignment.BottomCenter))
+        }
+
+        vm.selectedIssue?.let { issue ->
+            ExplainSheet(
+                issue = issue,
+                onSpeak = { vm.speak(issue.suggestion) },
+                onRewrite = { vm.rewrite(issue) },
+                onMarkCorrect = { vm.markCorrect(issue) },
+                onDismiss = { vm.dismissIssue() },
+            )
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// The board itself
+// -------------------------------------------------------------------------
+
+@Composable
+private fun BoardCanvas(vm: BoardViewModel) {
+    val measurer = rememberTextMeasurer()
+    val labelStyle = remember {
+        TextStyle(
+            fontFamily = FontFamily.Cursive,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 34.sp,
+            color = Brand.GreenInk,
+        )
+    }
+
+    Canvas(
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged {
+                vm.boardWidth = it.width.toFloat()
+                vm.boardHeight = it.height.toFloat()
+            }
+            .pointerInput(vm) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    vm.onDown(down.position, down.uptimeMillis)
+                    do {
+                        val event = awaitPointerEvent()
+                        for (change in event.changes) {
+                            if (change.positionChanged()) {
+                                for (h in change.historical) vm.onMove(h.position, h.uptimeMillis)
+                                vm.onMove(change.position, change.uptimeMillis)
+                                change.consume()
+                            }
+                        }
+                    } while (event.changes.any { it.pressed })
+                    vm.onUp()
+                }
+            },
+    ) {
+        // ruled lines
+        val spacing = BoardMetrics.LINE_SPACING_DP.dp.toPx()
+        val offset = BoardMetrics.LINE_OFFSET_DP.dp.toPx()
+        var y = offset + spacing - 1.dp.toPx()
+        while (y < size.height) {
+            drawLine(
+                color = Brand.RuleLine,
+                start = Offset(0f, y),
+                end = Offset(size.width, y),
+                strokeWidth = 2.dp.toPx(),
+            )
+            y += spacing
+        }
+
+        val inkStyle = Stroke(width = InkStrokeWidth.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
+
+        // finished strokes
+        for (s in vm.strokes) {
+            drawPath(s.path, color = Brand.Ink, style = inkStyle)
+        }
+        // the stroke that is being drawn right now
+        if (vm.activePoints.isNotEmpty()) {
+            drawPath(buildInkPath(vm.activePoints.toList()), color = Brand.Ink, style = inkStyle)
+        }
+
+        // corrections written on the board
+        for (issue in vm.issues) {
+            val b = issue.bounds.inflate(6.dp.toPx())
+            drawRoundRect(
+                color = Brand.Coral,
+                topLeft = b.topLeft,
+                size = b.size,
+                cornerRadius = CornerRadius(14.dp.toPx()),
+                style = Stroke(width = 3.dp.toPx()),
+            )
+
+            val layout = measurer.measure(issue.suggestion, labelStyle)
+            val lx = b.left.coerceAtLeast(14.dp.toPx())
+            val ly = (b.top - layout.size.height - 4.dp.toPx()).coerceAtLeast(8.dp.toPx())
+            drawRoundRect(
+                color = Color.White.copy(alpha = 0.92f),
+                topLeft = Offset(lx - 6.dp.toPx(), ly - 2.dp.toPx()),
+                size = Size(layout.size.width + 12.dp.toPx(), layout.size.height + 4.dp.toPx()),
+                cornerRadius = CornerRadius(10.dp.toPx()),
+            )
+            drawText(layout, topLeft = Offset(lx, ly))
+        }
+    }
+}
+
+@Composable
+private fun EmptyHint(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier.padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+            Text(
+                text = "write anything...",
+                style = TextStyle(
+                    fontFamily = FontFamily.Cursive,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 48.sp,
+                    color = Brand.Muted,
+                ),
+            )
+        }
+        Text(
+            text = "اكتب أي كلمة أو جملة بالإنجليزي بإيدك، وأنا هصححها قدامك على اللوحة",
+            style = TextStyle(fontSize = 16.sp, lineHeight = 26.sp, color = Brand.Muted),
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+// -------------------------------------------------------------------------
+// Top bar
+// -------------------------------------------------------------------------
+
+@Composable
+private fun TopBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
+    var showAbout by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .padding(top = 12.dp, start = 16.dp, end = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SquareButton(R.drawable.ic_menu, "عن التطبيق") { showAbout = true }
+            Wordmark()
+            IssueChip(vm.issues.size)
+        }
+        StatusBanner(vm)
+    }
+
+    if (showAbout) {
+        AlertDialog(
+            onDismissRequest = { showAbout = false },
+            confirmButton = { TextButton(onClick = { showAbout = false }) { Text("تمام") } },
+            title = { Text("Write Right AI") },
+            text = {
+                Text(
+                    "اكتب بالقلم على اللوحة، وأنا هراجع كل كلمة وأصحح الغلط قدامك.\n\n" +
+                        "• اكتب كل كلمة بين الخطوط.\n" +
+                        "• سيب مسافة صغيرة بين الكلمات.\n" +
+                        "• اضغط على أي تصحيح عشان أشرح لك الغلطة.",
+                )
+            },
+        )
+    }
+}
+
+@Composable
+private fun Wordmark() {
+    Box(
+        modifier = Modifier
+            .brandBox(Brand.Mint, 999.dp)
+            .padding(horizontal = 18.dp, vertical = 6.dp),
+    ) {
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+            Text(
+                text = "Write Right AI",
+                style = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.Black, color = Brand.Ink),
+            )
+        }
+    }
+}
+
+@Composable
+private fun IssueChip(count: Int) {
+    val bad = count > 0
+    Box(
+        modifier = Modifier
+            .height(48.dp)
+            .brandBox(if (bad) Brand.CoralSoft else Brand.MintSoft, 14.dp)
+            .padding(horizontal = 14.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = if (bad) issueCountText(count) else "كله تمام",
+            style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Brand.Ink),
+        )
+    }
+}
+
+private fun issueCountText(count: Int): String {
+    val n = count.toString().map { '٠' + (it - '0') }.joinToString("")
+    return when {
+        count == 1 -> "غلطة واحدة"
+        count == 2 -> "غلطتين"
+        count in 3..10 -> "$n غلطات"
+        else -> "$n غلطة"
+    }
+}
+
+@Composable
+private fun StatusBanner(vm: BoardViewModel) {
+    when {
+        vm.modelStatus == BoardViewModel.ModelStatus.Downloading ->
+            Pill("بنحمّل نموذج قراءة الخط (مرة واحدة بس)…", Brand.Yellow, null)
+
+        vm.modelStatus == BoardViewModel.ModelStatus.NeedsInternet ->
+            Pill("محتاج إنترنت عشان نحمّل نموذج قراءة الخط. اضغط للمحاولة", Brand.CoralSoft) { vm.retryModel() }
+
+        vm.modelStatus == BoardViewModel.ModelStatus.Unsupported ->
+            Pill("اللغة الإنجليزية مش متاحة في نموذج قراءة الخط", Brand.CoralSoft, null)
+
+        !vm.spellAvailable ->
+            Pill("المدقق الإملائي مقفول، فعّله من إعدادات الموبايل", Brand.CoralSoft, null)
+
+        else -> Unit
+    }
+}
+
+@Composable
+private fun Pill(text: String, bg: Color, onClick: (() -> Unit)?) {
+    val base = Modifier
+        .fillMaxWidth()
+        .brandBox(bg, 14.dp, shadow = 2.dp, border = 2.dp)
+    Box(
+        modifier = (if (onClick != null) base.clickable(role = Role.Button, onClick = onClick) else base)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+    ) {
+        Text(
+            text = text,
+            style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Brand.Ink),
+        )
+    }
+}
+
+// -------------------------------------------------------------------------
+// Bottom bar
+// -------------------------------------------------------------------------
+
+@Composable
+private fun BottomBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .windowInsetsPadding(WindowInsets.navigationBars)
+            .padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        val statusText = when {
+            vm.modelStatus != BoardViewModel.ModelStatus.Ready -> "جاهز بعد التحميل"
+            vm.analyzing -> "بيراجع…"
+            else -> "الـ AI بيراقب"
+        }
+        Row(
+            modifier = Modifier
+                .height(48.dp)
+                .brandBox(Brand.Yellow, 999.dp)
+                .padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Box(Modifier.size(10.dp).background(Brand.Ink, RoundedCornerShape(50)))
+            Text(
+                text = statusText,
+                style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Brand.Ink),
+            )
+        }
+
+        Row(
+            modifier = Modifier
+                .brandBox(Brand.Paper, 18.dp)
+                .padding(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ToolButton(R.drawable.ic_pen, "قلم", vm.tool == BoardViewModel.Tool.Pen) {
+                vm.tool = BoardViewModel.Tool.Pen
+            }
+            ToolButton(R.drawable.ic_eraser, "ممحاة", vm.tool == BoardViewModel.Tool.Eraser) {
+                vm.tool = BoardViewModel.Tool.Eraser
+            }
+            ToolButton(R.drawable.ic_undo, "تراجع", false) { vm.undo() }
+            ToolButton(R.drawable.ic_trash, "امسح الكل", false) { vm.clearAll() }
+        }
+    }
+}
+
+@Composable
+private fun ToolButton(iconRes: Int, description: String, selected: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(12.dp)
+    Box(
+        modifier = Modifier
+            .size(44.dp)
+            .background(if (selected) Brand.Mint else Brand.Paper, shape)
+            .border(3.dp, Brand.Ink, shape)
+            .clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            painter = painterResource(iconRes),
+            contentDescription = description,
+            tint = Brand.Ink,
+            modifier = Modifier.size(22.dp),
+        )
+    }
+}
+
+@Composable
+private fun SquareButton(iconRes: Int, description: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(48.dp)
+            .brandBox(Brand.Paper, 14.dp)
+            .clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            painter = painterResource(iconRes),
+            contentDescription = description,
+            tint = Brand.Ink,
+            modifier = Modifier.size(22.dp),
+        )
+    }
+}
