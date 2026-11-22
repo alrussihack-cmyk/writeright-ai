@@ -158,6 +158,23 @@ private fun BoardCanvas(vm: BoardViewModel) {
             drawPath(buildInkPath(vm.activePoints.toList()), color = Brand.Ink, style = inkStyle)
         }
 
+        // Words recognized correctly are confirmed in green so the user sees live feedback.
+        val confirmationStyle = labelStyle.copy(fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        for (recognized in vm.recognizedWords) {
+            val b = recognized.bounds
+            val text = "${recognized.text} ✓"
+            val layout = measurer.measure(text, confirmationStyle)
+            val lx = b.left.coerceAtLeast(14.dp.toPx())
+            val ly = (b.top - layout.size.height - 8.dp.toPx()).coerceAtLeast(8.dp.toPx())
+            drawRoundRect(
+                color = Brand.Mint.copy(alpha = 0.95f),
+                topLeft = Offset(lx - 6.dp.toPx(), ly - 3.dp.toPx()),
+                size = Size(layout.size.width + 12.dp.toPx(), layout.size.height + 6.dp.toPx()),
+                cornerRadius = CornerRadius(10.dp.toPx()),
+            )
+            drawText(layout, topLeft = Offset(lx, ly), color = Brand.GreenInk)
+        }
+
         // corrections written on the board
         for (issue in vm.issues) {
             val b = issue.bounds.inflate(6.dp.toPx())
