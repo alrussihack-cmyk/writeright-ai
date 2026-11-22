@@ -232,7 +232,7 @@ private fun EmptyHint(modifier: Modifier = Modifier) {
 
 @Composable
 private fun TopBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
-    var showAbout by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -246,26 +246,21 @@ private fun TopBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            SquareButton(R.drawable.ic_menu, "عن التطبيق") { showAbout = true }
+            SquareButton(R.drawable.ic_menu, "إعدادات الذكاء الاصطناعي") { showSettings = true }
             Wordmark()
             IssueChip(vm.issues.size)
         }
-        StatusBanner(vm)
+        StatusBanner(vm) { showSettings = true }
     }
 
-    if (showAbout) {
-        AlertDialog(
-            onDismissRequest = { showAbout = false },
-            confirmButton = { TextButton(onClick = { showAbout = false }) { Text("تمام") } },
-            title = { Text("Write Right AI") },
-            text = {
-                Text(
-                    "اكتب بالقلم على اللوحة، وأنا هراجع كل كلمة وأصحح الغلط قدامك.\n\n" +
-                        "• اكتب كل كلمة بين الخطوط.\n" +
-                        "• سيب مسافة صغيرة بين الكلمات.\n" +
-                        "• اضغط على أي تصحيح عشان أشرح لك الغلطة.",
-                )
-            },
+    if (showSettings) {
+        AiSettingsDialog(
+            savedApiKey = vm.apiKeyForSettings(),
+            savedModel = vm.aiModel,
+            status = vm.aiStatus,
+            onSave = { key, model -> vm.saveAiSettings(key, model) },
+            onTest = { key, model, callback -> vm.testAiConnection(key, model, callback) },
+            onDismiss = { showSettings = false },
         )
     }
 }
@@ -314,7 +309,7 @@ private fun issueCountText(count: Int): String {
 }
 
 @Composable
-private fun StatusBanner(vm: BoardViewModel) {
+private fun StatusBanner(vm: BoardViewModel, onOpenSettings: () -> Unit) {
     when {
         vm.modelStatus == BoardViewModel.ModelStatus.Downloading ->
             Pill("بنحمّل نموذج قراءة الخط (مرة واحدة بس)…", Brand.Yellow, null)
@@ -325,8 +320,11 @@ private fun StatusBanner(vm: BoardViewModel) {
         vm.modelStatus == BoardViewModel.ModelStatus.Unsupported ->
             Pill("اللغة الإنجليزية مش متاحة في نموذج قراءة الخط", Brand.CoralSoft, null)
 
-        !vm.spellAvailable ->
-            Pill("المدقق الإملائي مقفول، فعّله من إعدادات الموبايل", Brand.CoralSoft, null)
+        vm.aiStatus.startsWith("تعذر") ->
+            Pill(vm.aiStatus, Brand.CoralSoft, onOpenSettings)
+
+        !vm.aiConfigured ->
+            Pill("اضغط هنا لإضافة OpenRouter وتفعيل التصحيح الذكي", Brand.MintSoft, onOpenSettings)
 
         else -> Unit
     }
@@ -365,7 +363,7 @@ private fun BottomBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
         val statusText = when {
             vm.modelStatus != BoardViewModel.ModelStatus.Ready -> "جاهز بعد التحميل"
             vm.analyzing -> "بيراجع…"
-            else -> "الـ AI بيراقب"
+            else -> if (vm.aiConfigured) vm.aiStatus.take(30) else "وصّل OpenRouter"
         }
         Row(
             modifier = Modifier
