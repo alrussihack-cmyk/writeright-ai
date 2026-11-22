@@ -106,6 +106,53 @@ object MistakeAnalyzer {
     private fun max0(v: Int): Int = if (v < 0) 0 else v
 }
 
+/** Which letters of the written word are wrong, and where a letter is missing. */
+data class WrittenMarks(val wrong: Set<Int>, val gaps: Set<Int>)
+
+fun MistakeAnalyzer.writtenMarks(written: String, correct: String): WrittenMarks {
+    val a = written
+    val b = correct
+    val la = a.length
+    val lb = b.length
+    fun same(i: Int, j: Int) = a[i].lowercaseChar() == b[j].lowercaseChar()
+    val d = Array(la + 1) { IntArray(lb + 1) }
+    for (i in 0..la) d[i][0] = i
+    for (j in 0..lb) d[0][j] = j
+    for (i in 1..la) for (j in 1..lb) {
+        val cost = if (same(i - 1, j - 1)) 0 else 1
+        var v = minOf(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+        if (i > 1 && j > 1 && same(i - 1, j - 2) && same(i - 2, j - 1)) v = minOf(v, d[i - 2][j - 2] + 1)
+        d[i][j] = v
+    }
+    val wrong = HashSet<Int>()
+    val gaps = HashSet<Int>()
+    var i = la
+    var j = lb
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0) {
+            val cost = if (same(i - 1, j - 1)) 0 else 1
+            if (d[i][j] == d[i - 1][j - 1] + cost) {
+                if (cost == 1 || a[i - 1] != b[j - 1]) wrong.add(i - 1)
+                i--; j--
+                continue
+            }
+            if (i > 1 && j > 1 && same(i - 1, j - 2) && same(i - 2, j - 1) && d[i][j] == d[i - 2][j - 2] + 1) {
+                wrong.add(i - 1); wrong.add(i - 2)
+                i -= 2; j -= 2
+                continue
+            }
+        }
+        if (i > 0 && d[i][j] == d[i - 1][j] + 1) {
+            wrong.add(i - 1)
+            i--
+        } else {
+            gaps.add(i)
+            j--
+        }
+    }
+    return WrittenMarks(wrong, gaps)
+}
+
 object TextDistance {
     /** Edit distance where swapping two neighbour letters costs one step. */
     fun osa(a: String, b: String): Int {

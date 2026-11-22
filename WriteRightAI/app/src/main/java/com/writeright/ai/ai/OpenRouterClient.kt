@@ -19,6 +19,12 @@ data class AiReview(
     val corrections: List<AiWordCorrection>,
 )
 
+data class AiWordReading(
+    val written: String,
+    val corrected: String,
+    val explanation: String,
+)
+
 /** OpenRouter chat-completions client. The request contains the recognized text and a board image. */
 class OpenRouterClient {
     suspend fun review(apiKey: String, model: String, transcript: String, imageDataUrl: String): AiReview =
@@ -73,6 +79,39 @@ class OpenRouterClient {
                 correctedText = parsed.optString("corrected_text", transcript),
                 summary = parsed.optString("summary_ar", "تمت مراجعة الكتابة."),
                 corrections = corrections,
+            )
+        }
+
+    /** Reads ONE handwritten word from its image: what was written, and the correct spelling. */
+    suspend fun readWord(apiKey: String, model: String, imageDataUrl: String): AiWordReading =
+        withContext(Dispatchers.IO) {
+            val prompt = """
+                The image shows ONE handwritten English word that may be misspelled.
+                First read EXACTLY the letters the student wrote, letter by letter. Do NOT auto-correct while reading.
+                Then give the correct spelling of the word the student meant.
+                Return ONLY valid JSON: {"written":"letters as handwritten","correct":"correct spelling","explanation_ar":"short Arabic explanation of the mistake, empty if the word is correct"}
+                If the image is not a readable English word, return {"written":"","correct":"","explanation_ar":""}.
+            """.trimIndent()
+            val content = JSONArray()
+                .put(JSONObject().put("type", "text").put("text", prompt))
+                .put(
+                    JSONObject().put("type", "image_url")
+                        .put("image_url", JSONObject().put("url", imageDataUrl))
+                )
+            val body = JSONObject()
+                .put("model", model)
+                .put("temperature", 0)
+                .put("max_tokens", 1500)
+                .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", content)))
+            val response = post(apiKey, body)
+            val message = response.optJSONArray("choices")
+                ?.optJSONObject(0)?.optJSONObject("message")
+                ?: throw IllegalStateException("OpenRouter رجّع استجابة غير متوقعة")
+            val parsed = parseJsonObject(extractContent(message))
+            AiWordReading(
+                written = parsed.optString("written").trim(),
+                corrected = parsed.optString("correct").trim(),
+                explanation = parsed.optString("explanation_ar").trim(),
             )
         }
 

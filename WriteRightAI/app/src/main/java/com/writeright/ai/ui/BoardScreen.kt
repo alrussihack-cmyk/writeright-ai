@@ -38,6 +38,13 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
+import com.writeright.ai.analysis.MistakeAnalyzer
+import com.writeright.ai.analysis.writtenMarks
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -108,6 +115,15 @@ private fun BoardCanvas(vm: BoardViewModel) {
         )
     }
 
+    val cleanStyle = remember {
+        TextStyle(
+            fontFamily = FontFamily.Cursive,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 34.sp,
+            color = Brand.Ink,
+        )
+    }
+
     Canvas(
         modifier = Modifier
             .fillMaxSize()
@@ -149,13 +165,46 @@ private fun BoardCanvas(vm: BoardViewModel) {
 
         val inkStyle = Stroke(width = InkStrokeWidth.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
 
+        // words that were read are shown as a clean handwritten word, the raw ink is hidden
+        val converted = vm.convertedStrokeIds()
+
         // finished strokes
         for (s in vm.strokes) {
+            if (s.id in converted) continue
             drawPath(s.path, color = Brand.Ink, style = inkStyle)
         }
         // the stroke that is being drawn right now
         if (vm.activePoints.isNotEmpty()) {
             drawPath(buildInkPath(vm.activePoints.toList()), color = Brand.Ink, style = inkStyle)
+        }
+
+        // clean handwriting: a correct word is black, a wrong letter turns red
+        fun drawCleanWord(text: String, correct: String?, bounds: androidx.compose.ui.geometry.Rect) {
+            val annotated = cleanWordText(text, correct)
+            var fontPx = (bounds.height * 0.8f).coerceIn(30.dp.toPx(), 80.dp.toPx())
+            var layout = measurer.measure(annotated, cleanStyle.copy(fontSize = fontPx.toSp()))
+            val maxWidth = size.width - 28.dp.toPx()
+            if (layout.size.width > maxWidth) {
+                fontPx *= maxWidth / layout.size.width
+                layout = measurer.measure(annotated, cleanStyle.copy(fontSize = fontPx.toSp()))
+            }
+            val lx = (bounds.center.x - layout.size.width / 2f)
+                .coerceIn(8.dp.toPx(), (size.width - layout.size.width - 8.dp.toPx()).coerceAtLeast(8.dp.toPx()))
+            val ly = bounds.center.y - layout.size.height / 2f
+            drawRoundRect(
+                color = Color.White,
+                topLeft = Offset(lx - 8.dp.toPx(), ly),
+                size = Size(layout.size.width + 16.dp.toPx(), layout.size.height.toFloat()),
+                cornerRadius = CornerRadius(10.dp.toPx()),
+            )
+            drawText(layout, topLeft = Offset(lx, ly))
+        }
+
+        for (recognized in vm.recognizedWords) {
+            drawCleanWord(recognized.text, null, recognized.bounds)
+        }
+        for (issue in vm.issues) {
+            drawCleanWord(issue.written, issue.suggestion, issue.bounds)
         }
 
         // Words recognized correctly are confirmed in green so the user sees live feedback.
@@ -197,6 +246,45 @@ private fun BoardCanvas(vm: BoardViewModel) {
             )
             drawText(layout, topLeft = Offset(lx, ly))
         }
+
+        // the electronic pen in the user's hand: its tip is exactly where the ink is being drawn
+        if (vm.tool == BoardViewModel.Tool.Pen && vm.activePoints.isNotEmpty()) {
+            val tip = vm.activePoints.last()
+            val u = 1.dp.toPx()
+            fun at(dx: Float, dy: Float) = Offset(tip.x + dx * u, tip.y + dy * u)
+            val body = Path().apply {
+                val p0 = at(3f, -12f)
+                moveTo(p0.x, p0.y)
+                at(42f, -52f).let { lineTo(it.x, it.y) }
+                at(54f, -40f).let { lineTo(it.x, it.y) }
+                at(14f, -3f).let { lineTo(it.x, it.y) }
+                close()
+            }
+            val nib = Path().apply {
+                moveTo(tip.x, tip.y)
+                at(3f, -12f).let { lineTo(it.x, it.y) }
+                at(14f, -3f).let { lineTo(it.x, it.y) }
+                close()
+            }
+            drawPath(body, color = Brand.Mint)
+            drawPath(body, color = Brand.Ink, style = Stroke(width = 2.dp.toPx(), join = StrokeJoin.Round))
+            drawPath(nib, color = Brand.Ink)
+        }
+    }
+}
+
+private val WrongRed = Color(0xFFE5392D)
+
+/** The written word as clean text. Wrong letters are red, a missing letter is shown as a red underscore. */
+private fun cleanWordText(text: String, correct: String?): AnnotatedString {
+    val marks = if (correct != null) MistakeAnalyzer.writtenMarks(text, correct) else null
+    val red = SpanStyle(color = WrongRed, fontWeight = FontWeight.Black)
+    return buildAnnotatedString {
+        text.forEachIndexed { i, ch ->
+            if (marks != null && i in marks.gaps && i !in marks.wrong) withStyle(red) { append('_') }
+            if (marks != null && i in marks.wrong) withStyle(red) { append(ch) } else append(ch)
+        }
+        if (marks != null && text.length in marks.gaps) withStyle(red) { append('_') }
     }
 }
 

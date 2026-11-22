@@ -27,7 +27,7 @@ import com.google.mlkit.vision.digitalink.DigitalInkRecognizerOptions
 import com.google.mlkit.vision.digitalink.Ink
 import com.google.mlkit.vision.digitalink.RecognitionContext
 import com.google.mlkit.vision.digitalink.WritingArea
-import com.writeright.ai.ai.AiReview
+import com.writeright.ai.ai.AiWordReading
 import com.writeright.ai.ai.AiSettingsStore
 import com.writeright.ai.ai.OpenRouterClient
 import com.writeright.ai.analysis.MistakeAnalyzer
@@ -35,6 +35,9 @@ import com.writeright.ai.analysis.TextDistance
 import com.writeright.ai.speech.Speaker
 import com.writeright.ai.spell.SpellEngine
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
@@ -78,7 +81,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     private var nextId = 1
     private val ignored = HashSet<String>()
     private val cache = HashMap<String, Outcome>()
-    private val aiCache = HashMap<String, AiReview>()
+    private val aiCache = HashMap<String, AiWordReading>()
     private var analysisJob: Job? = null
 
     private var tapIssue: WordIssue? = null
@@ -255,6 +258,14 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     // Actions on a correction
     // ---------------------------------------------------------------------
 
+    /** Strokes that are shown as a clean handwritten word instead of the raw ink. */
+    fun convertedStrokeIds(): Set<Int> {
+        val ids = HashSet<Int>()
+        for (issue in issues) ids.addAll(issue.strokeIds)
+        for (word in recognizedWords) word.id.split(',').mapNotNull { it.toIntOrNull() }.forEach { ids.add(it) }
+        return ids
+    }
+
     fun speak(word: String) = speaker.speak(word)
 
     fun dismissIssue() {
@@ -300,7 +311,9 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun analyze() {
-        val rec = recognizer ?: return
+        val rec = recognizer
+        val hasKey = aiSettings.hasApiKey()
+        if (rec == null && !hasKey) return
         analyzing = true
         try {
             spellAvailable = spell.isAvailable()
@@ -310,117 +323,68 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                 lineSpacing = BoardMetrics.LINE_SPACING_DP * density,
                 lineOffset = BoardMetrics.LINE_OFFSET_DP * density,
                 wordGap = BoardMetrics.WORD_GAP_DP * density,
-            )
-            val found = mutableListOf<WordIssue>()
-            val recognized = mutableListOf<RecognizedWord>()
-            val tokenGroups = mutableListOf<Pair<WordGroup, String>>()
-            var lastError: String? = null
-            var unreadable = 0
-            for (g in groups) {
-                if (g.signature in ignored) continue
-                // a lone tap on the board is not a word
-                if (g.bounds.width < 10f * density && g.bounds.height < 10f * density) continue
-                var outcome = cache[g.signature]
-                if (outcome == null) {
-                    outcome = try {
+            ).filter {
+                it.signature !in ignored &&
+                    // a lone tap on the board is not a word
+                    !(it.bounds.width < 10f * density && it.bounds.height < 10f * density)
+            }
+
+            // 1. the vision model reads every new word from its own picture (all words at the same time)
+            var aiError: String? = null
+            val pending = groups.filter { cache[it.signature] == null }
+            if (hasKey && pending.isNotEmpty()) {
+                aiStatus = "الذكاء الاصطناعي بيقرأ الكتابة…"
+                val key = aiSettings.getApiKey().orEmpty()
+                val model = aiSettings.model
+                val results = coroutineScope {
+                    pending.map { g ->
+                        async {
+                            try {
+                                g to aiOutcome(key, model, g)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                aiError = e.message ?: "تحقق من المفتاح والإنترنت"
+                                g to null
+                            }
+                        }
+                    }.awaitAll()
+                }
+                for ((g, outcome) in results) if (outcome != null) cache[g.signature] = outcome
+            }
+
+            // 2. words the vision model could not give (no internet, no key...) use the on-device reader
+            if (rec != null) {
+                for (g in groups) {
+                    if (cache[g.signature] != null) continue
+                    val outcome = try {
                         checkGroup(rec, g)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        lastError = e.message ?: e.javaClass.simpleName
                         null
                     }
                     if (outcome != null) cache[g.signature] = outcome
                 }
-                if (outcome == null || (outcome.issue == null && outcome.recognized == null)) unreadable++
-                outcome?.issue?.let { found.add(it); tokenGroups.add(g to it.written) }
-                outcome?.recognized?.let { recognized.add(it); tokenGroups.add(g to it.text) }
             }
-            if (aiSettings.hasApiKey() && tokenGroups.isNotEmpty()) {
-                aiStatus = "الذكاء الاصطناعي بيراجع الكتابة والصورة…"
-                try {
-                    val transcript = tokenGroups.joinToString(" ") { it.second }
-                    val reviewKey = aiSettings.model + "|" +
-                        tokenGroups.joinToString(";") { it.first.signature + "=" + it.second }
-                    val review = aiCache[reviewKey] ?: aiClient.review(
-                        aiSettings.getApiKey() ?: "",
-                        aiSettings.model,
-                        transcript,
-                        renderBoardImage(tokenGroups.flatMap { it.first.strokes }.distinctBy { it.id }),
-                    ).also { aiCache[reviewKey] = it }
-                    val aiIssues = mutableListOf<WordIssue>()
-                    val correctedSignatures = mutableSetOf<String>()
-                    val used = mutableSetOf<String>()
-                    for (correction in review.corrections) {
-                        val match = tokenGroups.firstOrNull { (group, word) ->
-                            group.signature !in used && word.equals(correction.original, ignoreCase = true)
-                        } ?: tokenGroups
-                            .filter { (group, _) -> group.signature !in used }
-                            .map { it to TextDistance.osa(it.second.lowercase(), correction.original.lowercase()) }
-                            .filter { it.second <= 2 }
-                            .minByOrNull { it.second }
-                            ?.first
-                            ?: continue
-                        val (group, written) = match
-                        used.add(group.signature)
-                        correctedSignatures.add(group.signature)
-                        aiIssues.add(
-                            WordIssue(
-                                id = group.signature,
-                                strokeIds = group.strokes.map { it.id }.toSet(),
-                                bounds = group.bounds,
-                                written = written,
-                                suggestion = correction.corrected,
-                                info = MistakeAnalyzer.analyze(written, correction.corrected).copy(
-                                    title = correction.explanation.ifBlank {
-                                        MistakeAnalyzer.analyze(written, correction.corrected).title
-                                    },
-                                    tip = correction.explanation.ifBlank {
-                                        MistakeAnalyzer.analyze(written, correction.corrected).tip
-                                    },
-                                ),
-                            )
-                        )
-                    }
-                    found.clear()
-                    found.addAll(aiIssues)
-                    recognized.clear()
-                    recognized.addAll(tokenGroups.filter { it.first.signature !in correctedSignatures }
-                        .map { (group, word) -> RecognizedWord(group.signature, word, group.bounds) })
-                    aiFeedback = review.summary + if (review.correctedText.isNotBlank()) "\n" + review.correctedText else ""
-                    aiStatus = if (aiIssues.isEmpty()) "المراجعة اكتملت — الكتابة سليمة ✓" else "اكتشف الذكاء الاصطناعي ${aiIssues.size} ملاحظة"
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    aiStatus = "تعذر فحص OpenRouter: ${e.message ?: "تحقق من المفتاح والإنترنت"}"
-                    aiFeedback = ""
-                }
-            } else if (aiSettings.hasApiKey() && groups.isNotEmpty() && unreadable > 0) {
-                // the local reader could not read the writing: let the vision model read the image itself
-                aiStatus = "الذكاء الاصطناعي بيقرأ الخط من الصورة…"
-                try {
-                    val readable = groups.filter { !(it.bounds.width < 10f * density && it.bounds.height < 10f * density) }
-                    val reviewKey = aiSettings.model + "|image|" + readable.joinToString(";") { it.signature }
-                    val review = aiCache[reviewKey] ?: aiClient.review(
-                        aiSettings.getApiKey() ?: "",
-                        aiSettings.model,
-                        "(not available — read the handwriting from the image only)",
-                        renderBoardImage(readable.flatMap { it.strokes }.distinctBy { it.id }),
-                    ).also { aiCache[reviewKey] = it }
-                    val fixes = review.corrections.joinToString("\n") { "• ${it.original} ← ${it.corrected}: ${it.explanation}" }
-                    aiFeedback = listOf(review.summary, review.correctedText, fixes)
-                        .filter { it.isNotBlank() }.joinToString("\n")
-                    aiStatus = if (review.corrections.isEmpty()) "المراجعة اكتملت — الكتابة سليمة ✓" else "اكتشف الذكاء الاصطناعي ${review.corrections.size} ملاحظة"
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    aiStatus = "تعذر فحص OpenRouter: ${e.message ?: "تحقق من المفتاح والإنترنت"}"
-                    aiFeedback = ""
-                }
-            } else if (!aiSettings.hasApiKey()) {
-                aiStatus = if (unreadable > 0 && lastError != null) "تعذر قراءة الخط: $lastError"
-                else "المدقق المحلي فقط — أضف مفتاح OpenRouter"
+
+            val found = mutableListOf<WordIssue>()
+            val recognized = mutableListOf<RecognizedWord>()
+            val sentence = mutableListOf<String>()
+            for (g in groups) {
+                val outcome = cache[g.signature] ?: continue
+                outcome.issue?.let { found.add(it); sentence.add(it.suggestion) }
+                outcome.recognized?.let { recognized.add(it); sentence.add(it.text) }
             }
+
+            aiStatus = when {
+                !hasKey -> "المدقق المحلي فقط — أضف مفتاح OpenRouter"
+                aiError != null -> "تعذر فحص OpenRouter: $aiError"
+                found.isNotEmpty() -> "اكتشف الذكاء الاصطناعي ${found.size} ملاحظة"
+                recognized.isNotEmpty() -> "المراجعة اكتملت — الكتابة سليمة ✓"
+                else -> aiStatus
+            }
+            aiFeedback = if (hasKey && found.isNotEmpty()) "الكتابة الصحيحة: " + sentence.joinToString(" ") else ""
             issues.clear()
             issues.addAll(found)
             recognizedWords.clear()
@@ -428,6 +392,30 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         } finally {
             analyzing = false
         }
+    }
+
+    /** The vision model reads one word from its picture. Returns null when it could not read anything. */
+    private suspend fun aiOutcome(key: String, model: String, g: WordGroup): Outcome? {
+        val cacheKey = model + "|" + g.signature
+        val reading = aiCache[cacheKey]
+            ?: aiClient.readWord(key, model, renderBoardImage(g.strokes)).also { aiCache[cacheKey] = it }
+        val written = reading.written.filter { it.isLetter() || it == '\'' }.trim('\'')
+        val correct = reading.corrected.filter { it.isLetter() || it == '\'' }.trim('\'')
+        if (written.isEmpty()) return null
+        if (correct.isEmpty() || written == correct) {
+            return Outcome(null, RecognizedWord(g.signature, written, g.bounds))
+        }
+        val base = MistakeAnalyzer.analyze(written, correct)
+        return Outcome(
+            WordIssue(
+                id = g.signature,
+                strokeIds = g.strokes.map { it.id }.toSet(),
+                bounds = g.bounds,
+                written = written,
+                suggestion = correct,
+                info = base.copy(tip = reading.explanation.ifBlank { base.tip }),
+            )
+        )
     }
 
     /** Returns null when the check could not be done (it will be tried again later). */
