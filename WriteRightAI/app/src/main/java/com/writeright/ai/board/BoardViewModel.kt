@@ -37,12 +37,13 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     enum class ModelStatus { Checking, Downloading, Ready, NeedsInternet, Unsupported }
 
     /** Result of checking one group of strokes. A null issue means the word is fine. */
-    private class Outcome(val issue: WordIssue?)
+    private class Outcome(val issue: WordIssue?, val recognized: RecognizedWord? = null)
 
     // ---- state the UI reads ----
     val strokes = mutableStateListOf<StrokeData>()
     val activePoints = mutableStateListOf<InkPoint>()
     val issues = mutableStateListOf<WordIssue>()
+    val recognizedWords = mutableStateListOf<RecognizedWord>()
     var tool by mutableStateOf(Tool.Pen)
     var selectedIssue by mutableStateOf<WordIssue?>(null)
     var modelStatus by mutableStateOf(ModelStatus.Checking)
@@ -190,6 +191,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         strokes.clear()
         activePoints.clear()
         issues.clear()
+        recognizedWords.clear()
         cache.clear()
         ignored.clear()
         selectedIssue = null
@@ -218,6 +220,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     fun markCorrect(issue: WordIssue) {
         ignored.add(issue.id)
         issues.remove(issue)
+        recognizedWords.add(RecognizedWord(issue.id, issue.written, issue.bounds))
         selectedIssue = null
     }
 
@@ -228,6 +231,10 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     private fun dropStaleIssues() {
         val alive = strokes.map { it.id }.toHashSet()
         issues.removeAll { issue -> issue.strokeIds.any { it !in alive } }
+        recognizedWords.removeAll { word ->
+            val ids = word.id.split(',').mapNotNull { it.toIntOrNull() }.toSet()
+            ids.any { it !in alive }
+        }
     }
 
     private fun scheduleAnalysis() {
@@ -252,6 +259,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                 wordGap = BoardMetrics.WORD_GAP_DP * density,
             )
             val found = mutableListOf<WordIssue>()
+            val recognized = mutableListOf<RecognizedWord>()
             for (g in groups) {
                 if (g.signature in ignored) continue
                 var outcome = cache[g.signature]
@@ -266,9 +274,12 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                     if (outcome != null) cache[g.signature] = outcome
                 }
                 outcome?.issue?.let { found.add(it) }
+                outcome?.recognized?.let { recognized.add(it) }
             }
             issues.clear()
             issues.addAll(found)
+            recognizedWords.clear()
+            recognizedWords.addAll(recognized)
         } finally {
             analyzing = false
         }
@@ -292,7 +303,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         if (word.length < 2) return Outcome(null)
 
         val spelled = spell.check(word) ?: return null
-        if (spelled.isCorrect) return Outcome(null)
+        if (spelled.isCorrect) return Outcome(null, RecognizedWord(g.signature, word, g.bounds))
 
         val best = pickBest(word, spelled.suggestions) ?: return Outcome(null)
         return Outcome(
