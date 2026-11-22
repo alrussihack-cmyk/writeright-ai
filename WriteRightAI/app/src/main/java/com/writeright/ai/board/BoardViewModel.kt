@@ -314,8 +314,12 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             val found = mutableListOf<WordIssue>()
             val recognized = mutableListOf<RecognizedWord>()
             val tokenGroups = mutableListOf<Pair<WordGroup, String>>()
+            var lastError: String? = null
+            var unreadable = 0
             for (g in groups) {
                 if (g.signature in ignored) continue
+                // a lone tap on the board is not a word
+                if (g.bounds.width < 10f * density && g.bounds.height < 10f * density) continue
                 var outcome = cache[g.signature]
                 if (outcome == null) {
                     outcome = try {
@@ -323,10 +327,12 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
+                        lastError = e.message ?: e.javaClass.simpleName
                         null
                     }
                     if (outcome != null) cache[g.signature] = outcome
                 }
+                if (outcome == null || (outcome.issue == null && outcome.recognized == null)) unreadable++
                 outcome?.issue?.let { found.add(it); tokenGroups.add(g to it.written) }
                 outcome?.recognized?.let { recognized.add(it); tokenGroups.add(g to it.text) }
             }
@@ -389,8 +395,31 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                     aiStatus = "تعذر فحص OpenRouter: ${e.message ?: "تحقق من المفتاح والإنترنت"}"
                     aiFeedback = ""
                 }
+            } else if (aiSettings.hasApiKey() && groups.isNotEmpty() && unreadable > 0) {
+                // the local reader could not read the writing: let the vision model read the image itself
+                aiStatus = "الذكاء الاصطناعي بيقرأ الخط من الصورة…"
+                try {
+                    val readable = groups.filter { !(it.bounds.width < 10f * density && it.bounds.height < 10f * density) }
+                    val reviewKey = aiSettings.model + "|image|" + readable.joinToString(";") { it.signature }
+                    val review = aiCache[reviewKey] ?: aiClient.review(
+                        aiSettings.getApiKey() ?: "",
+                        aiSettings.model,
+                        "(not available — read the handwriting from the image only)",
+                        renderBoardImage(readable.flatMap { it.strokes }.distinctBy { it.id }),
+                    ).also { aiCache[reviewKey] = it }
+                    val fixes = review.corrections.joinToString("\n") { "• ${it.original} ← ${it.corrected}: ${it.explanation}" }
+                    aiFeedback = listOf(review.summary, review.correctedText, fixes)
+                        .filter { it.isNotBlank() }.joinToString("\n")
+                    aiStatus = if (review.corrections.isEmpty()) "المراجعة اكتملت — الكتابة سليمة ✓" else "اكتشف الذكاء الاصطناعي ${review.corrections.size} ملاحظة"
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    aiStatus = "تعذر فحص OpenRouter: ${e.message ?: "تحقق من المفتاح والإنترنت"}"
+                    aiFeedback = ""
+                }
             } else if (!aiSettings.hasApiKey()) {
-                aiStatus = "المدقق المحلي فقط — أضف مفتاح OpenRouter"
+                aiStatus = if (unreadable > 0 && lastError != null) "تعذر قراءة الخط: $lastError"
+                else "المدقق المحلي فقط — أضف مفتاح OpenRouter"
             }
             issues.clear()
             issues.addAll(found)

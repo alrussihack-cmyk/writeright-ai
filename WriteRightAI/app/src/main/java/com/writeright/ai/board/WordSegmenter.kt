@@ -14,6 +14,11 @@ import kotlin.math.min
  */
 object WordSegmenter {
 
+    /**
+     * Strokes belong to the same word when they are close horizontally and overlap vertically.
+     * The allowed gap grows with the size of the letters, so big handwriting that crosses
+     * several ruled lines still stays one word.
+     */
     fun group(
         strokes: List<StrokeData>,
         lineSpacing: Float,
@@ -22,27 +27,38 @@ object WordSegmenter {
     ): List<WordGroup> {
         if (strokes.isEmpty()) return emptyList()
 
-        val byLine = strokes.groupBy {
-            floor((it.bounds.center.y - lineOffset) / lineSpacing).toInt()
+        val n = strokes.size
+        val parent = IntArray(n) { it }
+        fun find(x: Int): Int {
+            var r = x
+            while (parent[r] != r) r = parent[r]
+            var c = x
+            while (parent[c] != r) { val next = parent[c]; parent[c] = r; c = next }
+            return r
         }
 
-        val result = mutableListOf<WordGroup>()
-        for (line in byLine.keys.sorted()) {
-            val sorted = byLine.getValue(line).sortedBy { it.bounds.left }
-            var current = mutableListOf<StrokeData>()
-            var right = Float.NEGATIVE_INFINITY
-            for (s in sorted) {
-                if (current.isNotEmpty() && s.bounds.left - right > wordGap) {
-                    result.add(build(current))
-                    current = mutableListOf()
-                    right = Float.NEGATIVE_INFINITY
+        val vTolerance = lineSpacing * 0.15f
+        for (i in 0 until n) {
+            val a = strokes[i].bounds
+            for (j in i + 1 until n) {
+                val b = strokes[j].bounds
+                val hGap = max(a.left, b.left) - min(a.right, b.right)
+                val vGap = max(a.top, b.top) - min(a.bottom, b.bottom)
+                val letterHeight = max(a.height, b.height)
+                val allowedGap = max(wordGap, letterHeight * 0.35f)
+                if (hGap <= allowedGap && vGap <= vTolerance) {
+                    parent[find(i)] = find(j)
                 }
-                current.add(s)
-                right = max(right, s.bounds.right)
             }
-            if (current.isNotEmpty()) result.add(build(current))
         }
-        return result
+
+        val clusters = HashMap<Int, MutableList<StrokeData>>()
+        for (i in 0 until n) clusters.getOrPut(find(i)) { mutableListOf() }.add(strokes[i])
+
+        return clusters.values.map { build(it) }.sortedWith(
+            compareBy<WordGroup>({ floor((it.bounds.center.y - lineOffset) / lineSpacing).toInt() })
+                .thenBy { it.bounds.left }
+        )
     }
 
     private fun build(list: List<StrokeData>): WordGroup {
