@@ -1,6 +1,13 @@
 package com.writeright.ai.board
 
 import android.app.Application
+import android.graphics.Bitmap
+import android.graphics.Canvas as AndroidCanvas
+import android.graphics.Color as AndroidColor
+import android.graphics.Paint as AndroidPaint
+import android.graphics.Path as AndroidPath
+import android.util.Base64
+import java.io.ByteArrayOutputStream
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -20,6 +27,8 @@ import com.google.mlkit.vision.digitalink.DigitalInkRecognizerOptions
 import com.google.mlkit.vision.digitalink.Ink
 import com.google.mlkit.vision.digitalink.RecognitionContext
 import com.google.mlkit.vision.digitalink.WritingArea
+import com.writeright.ai.ai.AiSettingsStore
+import com.writeright.ai.ai.OpenRouterClient
 import com.writeright.ai.analysis.MistakeAnalyzer
 import com.writeright.ai.analysis.TextDistance
 import com.writeright.ai.speech.Speaker
@@ -49,6 +58,10 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     var modelStatus by mutableStateOf(ModelStatus.Checking)
     var analyzing by mutableStateOf(false)
     var spellAvailable by mutableStateOf(true)
+    var aiConfigured by mutableStateOf(false)
+    var aiModel by mutableStateOf(AiSettingsStore.DEFAULT_MODEL)
+    var aiStatus by mutableStateOf("المدقق المحلي جاهز")
+    var aiFeedback by mutableStateOf("")
 
     // ---- set by the UI ----
     var density = 1f
@@ -57,6 +70,8 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- internals ----
     private val spell = SpellEngine(app)
+    private val aiSettings = AiSettingsStore(app)
+    private val aiClient = OpenRouterClient()
     private val speaker = Speaker(app)
     private var recognizer: DigitalInkRecognizer? = null
     private var nextId = 1
@@ -69,6 +84,9 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     private var moved = false
 
     init {
+        aiConfigured = aiSettings.hasApiKey()
+        aiModel = aiSettings.model
+        aiStatus = if (aiConfigured) "OpenRouter متصل بالإعدادات" else "أضف مفتاح OpenRouter لتفعيل التصحيح الذكي"
         viewModelScope.launch { prepareModel() }
     }
 
@@ -79,6 +97,29 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     fun retryModel() {
         modelStatus = ModelStatus.Checking
         viewModelScope.launch { prepareModel() }
+    }
+
+    fun saveAiSettings(apiKey: String, model: String) {
+        aiSettings.saveApiKey(apiKey)
+        aiSettings.model = model
+        aiModel = aiSettings.model
+        aiConfigured = aiSettings.hasApiKey()
+        aiStatus = if (aiConfigured) "إعدادات OpenRouter محفوظة" else "التصحيح المحلي فقط — أضف مفتاح API"
+        aiFeedback = ""
+        cache.clear()
+        scheduleAnalysis()
+    }
+
+    fun testAiConnection(apiKey: String, model: String, onResult: (String) -> Unit) {
+        viewModelScope.launch {
+            onResult("جاري اختبار الاتصال…")
+            try {
+                aiClient.test(apiKey.trim(), model.trim().ifBlank { AiSettingsStore.DEFAULT_MODEL })
+                onResult("الاتصال ناجح ✓")
+            } catch (e: Exception) {
+                onResult("فشل الاتصال: ${e.message ?: "خطأ غير معروف"}")
+            }
+        }
     }
 
     private suspend fun prepareModel() {
@@ -192,6 +233,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         activePoints.clear()
         issues.clear()
         recognizedWords.clear()
+        aiFeedback = ""
         cache.clear()
         ignored.clear()
         selectedIssue = null
@@ -260,6 +302,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             )
             val found = mutableListOf<WordIssue>()
             val recognized = mutableListOf<RecognizedWord>()
+            val tokenGroups = mutableListOf<Pair<WordGroup, String>>()
             for (g in groups) {
                 if (g.signature in ignored) continue
                 var outcome = cache[g.signature]
@@ -273,8 +316,63 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     if (outcome != null) cache[g.signature] = outcome
                 }
-                outcome?.issue?.let { found.add(it) }
-                outcome?.recognized?.let { recognized.add(it) }
+                outcome?.issue?.let { found.add(it); tokenGroups.add(g to it.written) }
+                outcome?.recognized?.let { recognized.add(it); tokenGroups.add(g to it.text) }
+            }
+            if (aiSettings.hasApiKey() && tokenGroups.isNotEmpty()) {
+                aiStatus = "الذكاء الاصطناعي بيراجع الكتابة والصورة…"
+                try {
+                    val transcript = tokenGroups.joinToString(" ") { it.second }
+                    val image = renderBoardImage(snapshot)
+                    val review = aiClient.review(
+                        aiSettings.getApiKey() ?: "",
+                        aiSettings.model,
+                        transcript,
+                        image,
+                    )
+                    val aiIssues = mutableListOf<WordIssue>()
+                    val correctedSignatures = mutableSetOf<String>()
+                    val used = mutableSetOf<String>()
+                    for (correction in review.corrections) {
+                        val match = tokenGroups.firstOrNull { (group, word) ->
+                            group.signature !in used && word.equals(correction.original, ignoreCase = true)
+                        } ?: continue
+                        val (group, written) = match
+                        used.add(group.signature)
+                        correctedSignatures.add(group.signature)
+                        aiIssues.add(
+                            WordIssue(
+                                id = group.signature,
+                                strokeIds = group.strokes.map { it.id }.toSet(),
+                                bounds = group.bounds,
+                                written = written,
+                                suggestion = correction.corrected,
+                                info = MistakeAnalyzer.analyze(written, correction.corrected).copy(
+                                    title = correction.explanation.ifBlank {
+                                        MistakeAnalyzer.analyze(written, correction.corrected).title
+                                    },
+                                    tip = correction.explanation.ifBlank {
+                                        MistakeAnalyzer.analyze(written, correction.corrected).tip
+                                    },
+                                ),
+                            )
+                        )
+                    }
+                    found.clear()
+                    found.addAll(aiIssues)
+                    recognized.clear()
+                    recognized.addAll(tokenGroups.filter { it.first.signature !in correctedSignatures }
+                        .map { (group, word) -> RecognizedWord(group.signature, word, group.bounds) })
+                    aiFeedback = review.summary + if (review.correctedText.isNotBlank()) "\\n" + review.correctedText else ""
+                    aiStatus = if (aiIssues.isEmpty()) "المراجعة اكتملت — الكتابة سليمة ✓" else "اكتشف الذكاء الاصطناعي ${aiIssues.size} ملاحظة"
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    aiStatus = "تعذر فحص OpenRouter: ${e.message ?: "تحقق من المفتاح والإنترنت"}"
+                    aiFeedback = ""
+                }
+            } else if (!aiSettings.hasApiKey()) {
+                aiStatus = "المدقق المحلي فقط — أضف مفتاح OpenRouter"
             }
             issues.clear()
             issues.addAll(found)
@@ -302,7 +400,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         val word = raw.filter { it.isLetter() || it == '\'' }.trim('\'')
         if (word.length < 2) return Outcome(null)
 
-        val spelled = spell.check(word) ?: return null
+        val spelled = spell.check(word) ?: return Outcome(null, RecognizedWord(g.signature, word, g.bounds))
         if (spelled.isCorrect) return Outcome(null, RecognizedWord(g.signature, word, g.bounds))
 
         val best = pickBest(word, spelled.suggestions) ?: return Outcome(null)
@@ -316,6 +414,49 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                 info = MistakeAnalyzer.analyze(word, best),
             )
         )
+    }
+
+
+    /** Render the vector strokes into a compact image for a vision-capable OpenRouter model. */
+    private fun renderBoardImage(snapshot: List<StrokeData>): String {
+        val scale = minOf(1f, 1200f / maxOf(boardWidth, boardHeight).coerceAtLeast(1f))
+        val width = (boardWidth * scale).toInt().coerceAtLeast(1)
+        val height = (boardHeight * scale).toInt().coerceAtLeast(1)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = AndroidCanvas(bitmap)
+        canvas.drawColor(AndroidColor.WHITE)
+        canvas.save()
+        canvas.scale(scale, scale)
+        val paint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+            color = AndroidColor.rgb(16, 33, 28)
+            style = AndroidPaint.Style.STROKE
+            strokeWidth = 5f * density
+            strokeCap = AndroidPaint.Cap.ROUND
+            strokeJoin = AndroidPaint.Join.ROUND
+        }
+        for (stroke in snapshot) {
+            if (stroke.points.isEmpty()) continue
+            val path = AndroidPath()
+            val first = stroke.points.first()
+            path.moveTo(first.x, first.y)
+            if (stroke.points.size == 1) {
+                path.lineTo(first.x + 0.2f, first.y)
+            } else {
+                for (index in 1 until stroke.points.size) {
+                    val previous = stroke.points[index - 1]
+                    val current = stroke.points[index]
+                    path.quadTo(previous.x, previous.y, (previous.x + current.x) / 2f, (previous.y + current.y) / 2f)
+                }
+                val last = stroke.points.last()
+                path.lineTo(last.x, last.y)
+            }
+            canvas.drawPath(path, paint)
+        }
+        canvas.restore()
+        val output = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 82, output)
+        bitmap.recycle()
+        return "data:image/jpeg;base64," + Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
     }
 
     /** The suggestion that is closest to what was written. */
