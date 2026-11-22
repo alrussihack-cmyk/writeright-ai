@@ -99,6 +99,8 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { prepareModel() }
     }
 
+    fun apiKeyForSettings(): String = aiSettings.getApiKey().orEmpty()
+
     fun saveAiSettings(apiKey: String, model: String) {
         aiSettings.saveApiKey(apiKey)
         aiSettings.model = model
