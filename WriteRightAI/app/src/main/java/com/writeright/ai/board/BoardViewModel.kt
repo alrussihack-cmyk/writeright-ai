@@ -32,6 +32,8 @@ import com.writeright.ai.ai.AiSettingsStore
 import com.writeright.ai.ai.OpenRouterClient
 import com.writeright.ai.analysis.MistakeAnalyzer
 import com.writeright.ai.analysis.TextDistance
+import com.writeright.ai.practice.PracticeWord
+import com.writeright.ai.practice.WordBank
 import com.writeright.ai.speech.Speaker
 import com.writeright.ai.spell.SpellEngine
 import kotlinx.coroutines.Job
@@ -46,6 +48,8 @@ import kotlin.coroutines.cancellation.CancellationException
 class BoardViewModel(app: Application) : AndroidViewModel(app) {
 
     enum class Tool { Pen, Eraser }
+
+    enum class PracticeResult { None, Correct, Wrong }
 
     enum class ModelStatus { Checking, Downloading, Ready, NeedsInternet, Unsupported }
 
@@ -67,6 +71,14 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     var aiStatus by mutableStateOf("المدقق المحلي جاهز")
     var aiFeedback by mutableStateOf("")
 
+    // ---- spelling practice: the app says a word, the user writes it ----
+    var practice by mutableStateOf(false)
+    var practiceTarget by mutableStateOf<PracticeWord?>(null)
+    var practiceResult by mutableStateOf(PracticeResult.None)
+    var practiceNote by mutableStateOf("")
+    var practiceCorrect by mutableStateOf(0)
+    var practiceWrong by mutableStateOf(0)
+
     // ---- set by the UI ----
     var density = 1f
     var boardWidth = 1080f
@@ -83,6 +95,8 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     private val cache = HashMap<String, Outcome>()
     private val aiCache = HashMap<String, AiWordReading>()
     private var analysisJob: Job? = null
+    private val practiceQueue = ArrayDeque<PracticeWord>()
+    private var resultCounted = false
 
     private var tapIssue: WordIssue? = null
     private var downPos = Offset.Zero
@@ -247,6 +261,8 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         issues.clear()
         recognizedWords.clear()
         aiFeedback = ""
+        practiceResult = PracticeResult.None
+        practiceNote = ""
         cache.clear()
         aiCache.clear()
         ignored.clear()
@@ -266,6 +282,39 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         return ids
     }
 
+    fun startPractice() {
+        practice = true
+        practiceCorrect = 0
+        practiceWrong = 0
+        nextWord()
+    }
+
+    fun stopPractice() {
+        practice = false
+        practiceTarget = null
+        practiceResult = PracticeResult.None
+        practiceNote = ""
+        clearAll()
+    }
+
+    /** Clears the board and says a new word. */
+    fun nextWord() {
+        clearAll()
+        if (practiceQueue.isEmpty()) practiceQueue.addAll(WordBank.words.shuffled())
+        practiceTarget = practiceQueue.removeFirst()
+        practiceResult = PracticeResult.None
+        practiceNote = ""
+        resultCounted = false
+        hearWord()
+    }
+
+    fun hearWord() {
+        practiceTarget?.let { speaker.speak(it.word) }
+    }
+
+    /** Checks what is written right now without waiting. */
+    fun checkNow() = scheduleAnalysis(0L)
+
     fun speak(word: String) = speaker.speak(word)
 
     fun dismissIssue() {
@@ -282,6 +331,10 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The user says the word is right (the recognizer probably misread the handwriting). */
     fun markCorrect(issue: WordIssue) {
+        if (practice) {
+            selectedIssue = null
+            return
+        }
         ignored.add(issue.id)
         issues.remove(issue)
         recognizedWords.add(RecognizedWord(issue.id, issue.written, issue.bounds))
@@ -301,11 +354,13 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun scheduleAnalysis() {
+    private fun scheduleAnalysis(waitMs: Long? = null) {
         dropStaleIssues()
         analysisJob?.cancel()
+        // in practice the word is judged after a longer pause, so it is not judged half written
+        val wait = waitMs ?: if (practice) 1800L else 900L
         analysisJob = viewModelScope.launch {
-            delay(900)
+            delay(wait)
             analyze()
         }
     }
@@ -377,6 +432,59 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                 outcome.recognized?.let { recognized.add(it); sentence.add(it.text) }
             }
 
+            if (practice) {
+                val target = practiceTarget?.word
+                val items = groups.mapNotNull { g ->
+                    val o = cache[g.signature]
+                    val text = o?.issue?.written ?: o?.recognized?.text
+                    if (text != null) g to text else null
+                }
+                found.clear()
+                recognized.clear()
+                if (target == null || groups.isEmpty()) {
+                    practiceResult = PracticeResult.None
+                    practiceNote = ""
+                } else if (items.size != groups.size) {
+                    practiceResult = PracticeResult.None
+                    practiceNote = "ما قدرتش أقرأ الخط — اكتب أكبر وأوضح وجرّب تاني"
+                } else {
+                    val used = items.flatMap { it.first.strokes }.distinctBy { it.id }.sortedBy { it.id }
+                    val id = used.joinToString(",") { it.id.toString() }
+                    var l = Float.MAX_VALUE
+                    var t = Float.MAX_VALUE
+                    var r = -Float.MAX_VALUE
+                    var b = -Float.MAX_VALUE
+                    for (item in items) {
+                        val bd = item.first.bounds
+                        if (bd.left < l) l = bd.left
+                        if (bd.top < t) t = bd.top
+                        if (bd.right > r) r = bd.right
+                        if (bd.bottom > b) b = bd.bottom
+                    }
+                    val bounds = Rect(l, t, r, b)
+                    val combined = items.joinToString("") { it.second }
+                    practiceNote = ""
+                    if (combined.equals(target, ignoreCase = true)) {
+                        recognized.add(RecognizedWord(id, target, bounds))
+                        practiceResult = PracticeResult.Correct
+                        if (!resultCounted) { practiceCorrect++; resultCounted = true }
+                    } else {
+                        found.add(
+                            WordIssue(
+                                id = id,
+                                strokeIds = used.map { it.id }.toSet(),
+                                bounds = bounds,
+                                written = combined,
+                                suggestion = target,
+                                info = MistakeAnalyzer.analyze(combined, target),
+                            )
+                        )
+                        practiceResult = PracticeResult.Wrong
+                        if (!resultCounted) { practiceWrong++; resultCounted = true }
+                    }
+                }
+            }
+
             aiStatus = when {
                 !hasKey -> "المدقق المحلي فقط — أضف مفتاح OpenRouter"
                 aiError != null -> "تعذر فحص OpenRouter: $aiError"
@@ -384,7 +492,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                 recognized.isNotEmpty() -> "المراجعة اكتملت — الكتابة سليمة ✓"
                 else -> aiStatus
             }
-            aiFeedback = if (hasKey && found.isNotEmpty()) "الكتابة الصحيحة: " + sentence.joinToString(" ") else ""
+            aiFeedback = if (!practice && hasKey && found.isNotEmpty()) "الكتابة الصحيحة: " + sentence.joinToString(" ") else ""
             issues.clear()
             issues.addAll(found)
             recognizedWords.clear()

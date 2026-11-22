@@ -79,7 +79,7 @@ fun BoardScreen(vm: BoardViewModel) {
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Box(Modifier.fillMaxSize().background(Brand.Paper)) {
             BoardCanvas(vm)
-            if (vm.strokes.isEmpty() && vm.activePoints.isEmpty()) {
+            if (!vm.practice && vm.strokes.isEmpty() && vm.activePoints.isEmpty()) {
                 EmptyHint(Modifier.align(Alignment.Center))
             }
             TopBar(vm, Modifier.align(Alignment.TopCenter))
@@ -93,6 +93,7 @@ fun BoardScreen(vm: BoardViewModel) {
                 onRewrite = { vm.rewrite(issue) },
                 onMarkCorrect = { vm.markCorrect(issue) },
                 onDismiss = { vm.dismissIssue() },
+                showMarkCorrect = !vm.practice,
             )
         }
     }
@@ -339,6 +340,7 @@ private fun TopBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
             IssueChip(vm.issues.size)
         }
         StatusBanner(vm) { showSettings = true }
+        if (vm.practice) PracticePanel(vm)
     }
 
     if (showSettings) {
@@ -445,34 +447,31 @@ private fun BottomBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
             .fillMaxWidth()
             .windowInsetsPadding(WindowInsets.navigationBars)
             .padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-    if (vm.aiFeedback.isNotBlank()) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .brandBox(Brand.MintSoft, 14.dp, shadow = 2.dp, border = 2.dp)
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-        ) {
-            Text(
-                text = vm.aiFeedback,
-                style = TextStyle(fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold, color = Brand.Ink),
-            )
+        if (vm.aiFeedback.isNotBlank()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .brandBox(Brand.MintSoft, 14.dp, shadow = 2.dp, border = 2.dp)
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+            ) {
+                Text(
+                    text = vm.aiFeedback,
+                    style = TextStyle(fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold, color = Brand.Ink),
+                )
+            }
         }
-    }
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
+
         val statusText = when {
-            vm.modelStatus != BoardViewModel.ModelStatus.Ready -> "جاهز بعد التحميل"
+            vm.modelStatus != BoardViewModel.ModelStatus.Ready && !vm.aiConfigured -> "جاهز بعد التحميل"
             vm.analyzing -> "بيراجع…"
             else -> if (vm.aiConfigured) vm.aiStatus.take(30) else "وصّل OpenRouter"
         }
         Row(
             modifier = Modifier
-                .height(48.dp)
+                .height(40.dp)
                 .brandBox(Brand.Yellow, 999.dp)
                 .padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -481,6 +480,7 @@ private fun BottomBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
             Box(Modifier.size(10.dp).background(Brand.Ink, RoundedCornerShape(50)))
             Text(
                 text = statusText,
+                maxLines = 1,
                 style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Brand.Ink),
             )
         }
@@ -499,8 +499,86 @@ private fun BottomBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
             }
             ToolButton(R.drawable.ic_undo, "تراجع", false) { vm.undo() }
             ToolButton(R.drawable.ic_trash, "امسح الكل", false) { vm.clearAll() }
+            ToolButton(R.drawable.ic_school, "تدريب الإملاء", vm.practice) {
+                if (vm.practice) vm.stopPractice() else vm.startPractice()
+            }
         }
     }
+}
+
+// -------------------------------------------------------------------------
+// Spelling practice
+// -------------------------------------------------------------------------
+
+@Composable
+private fun PracticePanel(vm: BoardViewModel) {
+    val word = vm.practiceTarget
+    val bg = when (vm.practiceResult) {
+        BoardViewModel.PracticeResult.Correct -> Brand.MintSoft
+        BoardViewModel.PracticeResult.Wrong -> Brand.CoralSoft
+        else -> Brand.Paper
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .brandBox(bg, 16.dp, shadow = 3.dp, border = 3.dp)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "تدريب الإملاء   ✓ ${vm.practiceCorrect}   ✗ ${vm.practiceWrong}",
+                style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.Black, color = Brand.Ink),
+            )
+            SmallButton("إنهاء", Brand.CoralSoft) { vm.stopPractice() }
+        }
+        Text(
+            text = if (word != null) "اسمع الكلمة واكتبها بالإنجليزي — معناها: ${word.meaning}" else "…",
+            style = TextStyle(fontSize = 14.sp, lineHeight = 21.sp, fontWeight = FontWeight.SemiBold, color = Brand.Ink),
+        )
+        when (vm.practiceResult) {
+            BoardViewModel.PracticeResult.Correct -> Text(
+                text = "صح! أحسنت 🎉",
+                style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.Black, color = Brand.GreenInk),
+            )
+            BoardViewModel.PracticeResult.Wrong -> Text(
+                text = "غلط — الصح: ${word?.word.orEmpty()}\nالحروف الغلط ظاهرة بالأحمر. اضغط عليها للشرح.",
+                style = TextStyle(fontSize = 15.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = Brand.CoralDeep),
+            )
+            else -> if (vm.practiceNote.isNotBlank()) Text(
+                text = vm.practiceNote,
+                style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Brand.CoralDeep),
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SmallButton("🔊 اسمع", Brand.Mint, Modifier.weight(1f)) { vm.hearWord() }
+            SmallButton("تحقق", Brand.Yellow, Modifier.weight(1f)) { vm.checkNow() }
+            SmallButton(
+                if (vm.practiceResult == BoardViewModel.PracticeResult.Correct) "التالية ←" else "تخطي",
+                Brand.Paper,
+                Modifier.weight(1f),
+            ) { vm.nextWord() }
+        }
+    }
+}
+
+@Composable
+private fun SmallButton(text: String, bg: Color, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    Box(
+        modifier = modifier
+            .brandBox(bg, 12.dp, shadow = 2.dp, border = 2.dp)
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = text,
+            style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Black, color = Brand.Ink),
+        )
     }
 }
 

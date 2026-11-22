@@ -46,6 +46,7 @@ fun ExplainSheet(
     onRewrite: () -> Unit,
     onMarkCorrect: () -> Unit,
     onDismiss: () -> Unit,
+    showMarkCorrect: Boolean = true,
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -156,6 +157,7 @@ fun ExplainSheet(
                 }
             }
 
+            if (showMarkCorrect) {
             TextButton(
                 onClick = onMarkCorrect,
                 modifier = Modifier.align(Alignment.CenterHorizontally),
@@ -164,6 +166,7 @@ fun ExplainSheet(
                     text = "أنا كاتبها صح (القراءة غلطت)",
                     style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Brand.Ink),
                 )
+            }
             }
         }
     }
