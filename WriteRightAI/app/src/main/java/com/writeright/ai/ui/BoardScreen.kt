@@ -352,11 +352,28 @@ private fun Pill(text: String, bg: Color, onClick: (() -> Unit)?) {
 
 @Composable
 private fun BottomBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
-    Row(
+    Column(
         modifier = modifier
             .fillMaxWidth()
             .windowInsetsPadding(WindowInsets.navigationBars)
             .padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+    if (vm.aiFeedback.isNotBlank()) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .brandBox(Brand.MintSoft, 14.dp, shadow = 2.dp, border = 2.dp)
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+        ) {
+            Text(
+                text = vm.aiFeedback,
+                style = TextStyle(fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold, color = Brand.Ink),
+            )
+        }
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -395,6 +412,7 @@ private fun BottomBar(vm: BoardViewModel, modifier: Modifier = Modifier) {
             ToolButton(R.drawable.ic_undo, "تراجع", false) { vm.undo() }
             ToolButton(R.drawable.ic_trash, "امسح الكل", false) { vm.clearAll() }
         }
+    }
     }
 }
 

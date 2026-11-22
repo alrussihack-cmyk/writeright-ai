@@ -52,17 +52,15 @@ class OpenRouterClient {
             val body = JSONObject()
                 .put("model", model)
                 .put("temperature", 0.1)
-                .put("max_tokens", 900)
+                .put("max_tokens", 2000)
                 .put("messages", messages)
 
             val response = post(apiKey, body)
             val message = response.optJSONArray("choices")
                 ?.optJSONObject(0)?.optJSONObject("message")
                 ?: throw IllegalStateException("OpenRouter رجّع استجابة غير متوقعة")
-            val raw = message.opt("content")?.toString()?.trim().orEmpty()
-            val jsonText = raw.removePrefix("```json").removePrefix("```")
-                .removeSuffix("```").trim()
-            val parsed = JSONObject(jsonText)
+            val raw = extractContent(message)
+            val parsed = parseJsonObject(raw)
             val items = parsed.optJSONArray("corrections") ?: JSONArray()
             val corrections = (0 until items.length()).mapNotNull { index ->
                 val item = items.optJSONObject(index) ?: return@mapNotNull null
@@ -77,6 +75,36 @@ class OpenRouterClient {
                 corrections = corrections,
             )
         }
+
+    /** The reply text can be a string or a list of parts, depending on the provider. */
+    private fun extractContent(message: JSONObject): String {
+        val content = message.opt("content")
+        val text = when (content) {
+            is JSONArray -> buildString {
+                for (i in 0 until content.length()) {
+                    val part = content.opt(i)
+                    if (part is JSONObject) append(part.optString("text")) else if (part is String) append(part)
+                }
+            }
+            null, JSONObject.NULL -> ""
+            else -> content.toString()
+        }
+        return text.trim()
+    }
+
+    /** Takes the JSON object out of the reply even when the model adds text or code fences around it. */
+    private fun parseJsonObject(raw: String): JSONObject {
+        val start = raw.indexOf('{')
+        val end = raw.lastIndexOf('}')
+        if (start < 0 || end <= start) {
+            throw IllegalStateException("النموذج ما رجّعش رد مفهوم. جرّب موديل تاني يدعم الصور")
+        }
+        return try {
+            JSONObject(raw.substring(start, end + 1))
+        } catch (e: org.json.JSONException) {
+            throw IllegalStateException("رد النموذج مش بصيغة صحيحة. جرّب تكتب تاني أو غيّر الموديل")
+        }
+    }
 
     suspend fun test(apiKey: String, model: String) = withContext(Dispatchers.IO) {
         val messages = JSONArray().put(

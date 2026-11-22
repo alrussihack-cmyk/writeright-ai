@@ -27,6 +27,7 @@ import com.google.mlkit.vision.digitalink.DigitalInkRecognizerOptions
 import com.google.mlkit.vision.digitalink.Ink
 import com.google.mlkit.vision.digitalink.RecognitionContext
 import com.google.mlkit.vision.digitalink.WritingArea
+import com.writeright.ai.ai.AiReview
 import com.writeright.ai.ai.AiSettingsStore
 import com.writeright.ai.ai.OpenRouterClient
 import com.writeright.ai.analysis.MistakeAnalyzer
@@ -77,6 +78,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     private var nextId = 1
     private val ignored = HashSet<String>()
     private val cache = HashMap<String, Outcome>()
+    private val aiCache = HashMap<String, AiReview>()
     private var analysisJob: Job? = null
 
     private var tapIssue: WordIssue? = null
@@ -102,13 +104,19 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     fun apiKeyForSettings(): String = aiSettings.getApiKey().orEmpty()
 
     fun saveAiSettings(apiKey: String, model: String) {
-        aiSettings.saveApiKey(apiKey)
+        try {
+            aiSettings.saveApiKey(apiKey)
+        } catch (e: Exception) {
+            aiStatus = "تعذر حفظ المفتاح على الجهاز: ${e.message ?: "خطأ في التشفير"}"
+            return
+        }
         aiSettings.model = model
         aiModel = aiSettings.model
         aiConfigured = aiSettings.hasApiKey()
         aiStatus = if (aiConfigured) "إعدادات OpenRouter محفوظة" else "التصحيح المحلي فقط — أضف مفتاح API"
         aiFeedback = ""
         cache.clear()
+        aiCache.clear()
         scheduleAnalysis()
     }
 
@@ -237,6 +245,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         recognizedWords.clear()
         aiFeedback = ""
         cache.clear()
+        aiCache.clear()
         ignored.clear()
         selectedIssue = null
         analysisJob?.cancel()
@@ -325,20 +334,27 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                 aiStatus = "الذكاء الاصطناعي بيراجع الكتابة والصورة…"
                 try {
                     val transcript = tokenGroups.joinToString(" ") { it.second }
-                    val image = renderBoardImage(snapshot)
-                    val review = aiClient.review(
+                    val reviewKey = aiSettings.model + "|" +
+                        tokenGroups.joinToString(";") { it.first.signature + "=" + it.second }
+                    val review = aiCache[reviewKey] ?: aiClient.review(
                         aiSettings.getApiKey() ?: "",
                         aiSettings.model,
                         transcript,
-                        image,
-                    )
+                        renderBoardImage(tokenGroups.flatMap { it.first.strokes }.distinctBy { it.id }),
+                    ).also { aiCache[reviewKey] = it }
                     val aiIssues = mutableListOf<WordIssue>()
                     val correctedSignatures = mutableSetOf<String>()
                     val used = mutableSetOf<String>()
                     for (correction in review.corrections) {
                         val match = tokenGroups.firstOrNull { (group, word) ->
                             group.signature !in used && word.equals(correction.original, ignoreCase = true)
-                        } ?: continue
+                        } ?: tokenGroups
+                            .filter { (group, _) -> group.signature !in used }
+                            .map { it to TextDistance.osa(it.second.lowercase(), correction.original.lowercase()) }
+                            .filter { it.second <= 2 }
+                            .minByOrNull { it.second }
+                            ?.first
+                            ?: continue
                         val (group, written) = match
                         used.add(group.signature)
                         correctedSignatures.add(group.signature)
@@ -365,7 +381,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                     recognized.clear()
                     recognized.addAll(tokenGroups.filter { it.first.signature !in correctedSignatures }
                         .map { (group, word) -> RecognizedWord(group.signature, word, group.bounds) })
-                    aiFeedback = review.summary + if (review.correctedText.isNotBlank()) "\\n" + review.correctedText else ""
+                    aiFeedback = review.summary + if (review.correctedText.isNotBlank()) "\n" + review.correctedText else ""
                     aiStatus = if (aiIssues.isEmpty()) "المراجعة اكتملت — الكتابة سليمة ✓" else "اكتشف الذكاء الاصطناعي ${aiIssues.size} ملاحظة"
                 } catch (e: CancellationException) {
                     throw e
@@ -419,16 +435,38 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     }
 
 
-    /** Render the vector strokes into a compact image for a vision-capable OpenRouter model. */
+    /** Renders the written strokes (cropped to the writing area) into an image for the vision model. */
     private fun renderBoardImage(snapshot: List<StrokeData>): String {
-        val scale = minOf(1f, 1200f / maxOf(boardWidth, boardHeight).coerceAtLeast(1f))
-        val width = (boardWidth * scale).toInt().coerceAtLeast(1)
-        val height = (boardHeight * scale).toInt().coerceAtLeast(1)
+        val strokesToDraw = snapshot.filter { it.points.isNotEmpty() }
+        var left = Float.MAX_VALUE
+        var top = Float.MAX_VALUE
+        var right = -Float.MAX_VALUE
+        var bottom = -Float.MAX_VALUE
+        for (s in strokesToDraw) {
+            left = minOf(left, s.bounds.left)
+            top = minOf(top, s.bounds.top)
+            right = maxOf(right, s.bounds.right)
+            bottom = maxOf(bottom, s.bounds.bottom)
+        }
+        if (strokesToDraw.isEmpty()) {
+            left = 0f; top = 0f; right = 1f; bottom = 1f
+        }
+        val pad = 32f * density
+        left = (left - pad).coerceAtLeast(0f)
+        top = (top - pad).coerceAtLeast(0f)
+        right += pad
+        bottom += pad
+        val cropW = (right - left).coerceAtLeast(1f)
+        val cropH = (bottom - top).coerceAtLeast(1f)
+        // keep the image small enough to upload quickly but big enough to read
+        val scale = (1280f / maxOf(cropW, cropH)).coerceIn(0.4f, 1.5f)
+        val width = (cropW * scale).toInt().coerceAtLeast(1)
+        val height = (cropH * scale).toInt().coerceAtLeast(1)
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = AndroidCanvas(bitmap)
         canvas.drawColor(AndroidColor.WHITE)
-        canvas.save()
         canvas.scale(scale, scale)
+        canvas.translate(-left, -top)
         val paint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
             color = AndroidColor.rgb(16, 33, 28)
             style = AndroidPaint.Style.STROKE
@@ -436,8 +474,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             strokeCap = AndroidPaint.Cap.ROUND
             strokeJoin = AndroidPaint.Join.ROUND
         }
-        for (stroke in snapshot) {
-            if (stroke.points.isEmpty()) continue
+        for (stroke in strokesToDraw) {
             val path = AndroidPath()
             val first = stroke.points.first()
             path.moveTo(first.x, first.y)
@@ -454,9 +491,8 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             }
             canvas.drawPath(path, paint)
         }
-        canvas.restore()
         val output = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 82, output)
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)
         bitmap.recycle()
         return "data:image/jpeg;base64," + Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
     }
