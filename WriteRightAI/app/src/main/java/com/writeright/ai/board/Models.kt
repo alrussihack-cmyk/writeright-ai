@@ -57,6 +57,9 @@ class WordGroup(val strokes: List<StrokeData>, val bounds: Rect) {
     val signature: String = strokes.joinToString(",") { it.id.toString() }
 }
 
+/** A word the handwriting recognizer read and the spell checker accepted. */
+data class RecognizedWord(val id: String, val text: String, val bounds: Rect)
+
 /** A written word that is spelled wrong, with its suggested fix. */
 data class WordIssue(
     val id: String,
